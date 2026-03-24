@@ -7,9 +7,39 @@ import { FigmaCommand, FigmaResponse, CommandProgressUpdate, PendingRequest, Pro
 // WebSocket connection and request tracking
 let ws: WebSocket | null = null;
 let currentChannel: string | null = null;
+let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
 
 // Map of pending requests for promise tracking
 const pendingRequests = new Map<string, PendingRequest>();
+
+// Per-command timeout overrides (ms). Commands not listed use DEFAULT_TIMEOUT.
+const COMMAND_TIMEOUTS: Partial<Record<FigmaCommand, number>> = {
+  // Simple reads — in-memory state, should complete in <1s
+  get_document_info: 10000,
+  get_selection: 10000,
+  get_pages: 10000,
+  get_styles: 10000,
+  get_node_info: 10000,
+  get_nodes_info: 15000,
+  get_local_components: 15000,
+  get_remote_components: 15000,
+  get_variables: 10000,
+  get_figjam_elements: 10000,
+  get_grid: 10000,
+  get_guide: 10000,
+  get_annotation: 10000,
+  get_styled_text_segments: 10000,
+  get_image_from_node: 15000,
+  ping: 5000,
+  join: 10000,
+  // Heavy operations — keep long timeout
+  export_node_as_image: 120000,
+  scan_text_nodes: 120000,
+  set_multiple_text_contents: 120000,
+  get_svg: 60000,
+  set_svg: 60000,
+};
+const DEFAULT_TIMEOUT = 30000; // 30s, down from 60s
 
 /**
  * Connects to the Figma server via WebSocket.
@@ -53,6 +83,14 @@ export function connectToFigma(port: number = defaultPort) {
       logger.info('Connected to Figma socket server');
       // Reset channel on new connection
       currentChannel = null;
+
+      // Start keepalive ping every 30s to prevent idle disconnection
+      if (keepaliveInterval) clearInterval(keepaliveInterval);
+      keepaliveInterval = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.ping();
+        }
+      }, 30000);
     });
 
     ws.on("message", (data: any) => {
@@ -142,6 +180,10 @@ export function connectToFigma(port: number = defaultPort) {
 
     ws.on('close', (code, reason) => {
       clearTimeout(connectionTimeout);
+      if (keepaliveInterval) {
+        clearInterval(keepaliveInterval);
+        keepaliveInterval = null;
+      }
       logger.info(`Disconnected from Figma socket server with code ${code} and reason: ${reason || 'No reason provided'}`);
       ws = null;
 
@@ -214,20 +256,25 @@ export function getCurrentChannel(): string | null {
 export function sendCommandToFigma(
   command: FigmaCommand,
   params: unknown = {},
-  timeoutMs: number = 60000
+  timeoutMs?: number
 ): Promise<unknown> {
+  const effectiveTimeout = timeoutMs ?? COMMAND_TIMEOUTS[command] ?? DEFAULT_TIMEOUT;
+
   return new Promise((resolve, reject) => {
     // If not connected, try to connect first
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       connectToFigma();
-      reject(new Error("Not connected to Figma. Attempting to connect..."));
+      reject(new Error(
+        "Not connected to Figma bridge server. Attempting to reconnect... " +
+        "Please wait a moment and try again, or check that the bridge server is running on port " + defaultPort
+      ));
       return;
     }
 
     // Check if we need a channel for this command
     const requiresChannel = command !== "join";
     if (requiresChannel && !currentChannel) {
-      reject(new Error("Must join a channel before sending commands"));
+      reject(new Error("Must join a channel before sending commands. Use join_channel first."));
       return;
     }
 
@@ -248,14 +295,17 @@ export function sendCommandToFigma(
       },
     };
 
-    // Set timeout for request
+    // Set timeout for request using per-command or default timeout
     const timeout = setTimeout(() => {
       if (pendingRequests.has(id)) {
         pendingRequests.delete(id);
-        logger.error(`Request ${id} to Figma timed out after ${timeoutMs / 1000} seconds`);
-        reject(new Error('Request to Figma timed out'));
+        logger.error(`Request ${id} ("${command}") timed out after ${effectiveTimeout / 1000} seconds`);
+        reject(new Error(
+          `Request "${command}" timed out after ${effectiveTimeout / 1000}s. ` +
+          `The Figma plugin may be disconnected. Use get_connection_status to check.`
+        ));
       }
-    }, timeoutMs);
+    }, effectiveTimeout);
 
     // Store the promise callbacks to resolve/reject later
     pendingRequests.set(id, {
@@ -266,8 +316,30 @@ export function sendCommandToFigma(
     });
 
     // Send the request
-    logger.info(`Sending command to Figma: ${command}`);
+    logger.info(`Sending command to Figma: ${command} (timeout: ${effectiveTimeout / 1000}s)`);
     logger.debug(`Request details: ${JSON.stringify(request)}`);
     ws.send(JSON.stringify(request));
   });
+}
+
+/**
+ * Check the health of the current channel by querying the bridge server's HTTP endpoint.
+ * Returns connection state, channel name, and number of active clients.
+ */
+export async function checkChannelHealth(): Promise<{ connected: boolean; channel: string | null; clients: number }> {
+  if (!currentChannel) {
+    return { connected: false, channel: null, clients: 0 };
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return { connected: false, channel: currentChannel, clients: 0 };
+  }
+  try {
+    const host = serverUrl === 'localhost' ? 'localhost' : serverUrl;
+    const url = `http://${host}:${defaultPort}/channels/${encodeURIComponent(currentChannel)}`;
+    const resp = await fetch(url);
+    const data = await resp.json() as { clients?: number };
+    return { connected: true, channel: currentChannel, clients: data.clients ?? 0 };
+  } catch {
+    return { connected: true, channel: currentChannel, clients: -1 };
+  }
 }
