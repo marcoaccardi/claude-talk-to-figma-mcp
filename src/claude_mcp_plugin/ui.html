@@ -272,6 +272,18 @@
             channel: null,
           };
 
+          // Auto-reconnect with exponential backoff
+          this.reconnect = {
+            enabled: true,
+            attempt: 0,
+            maxAttempts: 20,
+            baseDelay: 2000,
+            maxDelay: 30000,
+            timer: null,
+            lastChannel: null,
+          };
+          this.keepaliveInterval = null;
+
           // Cache DOM elements
           this.ui = {
             connectBtn: document.getElementById("btn-connect"),
@@ -338,6 +350,14 @@
               return;
             }
 
+            // Prevent duplicate connections if socket is still connecting
+            if (this.state.socket && this.state.socket.readyState === WebSocket.CONNECTING) {
+              return;
+            }
+
+            // Re-enable auto-reconnect on manual connect
+            this.reconnect.enabled = true;
+
             this.updateStatus(false, "Connecting...");
             this.ui.connectionStatus.className = "mcp-plugin__connection-status info";
             
@@ -345,7 +365,8 @@
             this.state.socket = new WebSocket(`ws://localhost:${port}`);
 
             this.state.socket.onopen = () => {
-              const channelName = this.generateChannelName();
+              // Reuse previous channel on reconnect, or generate a new one
+              const channelName = this.reconnect.lastChannel || this.generateChannelName();
               console.log("Joining channel:", channelName);
               this.state.channel = channelName;
 
@@ -366,6 +387,19 @@
                   if (data.message && data.message.result) {
                     this.state.connected = true;
                     const channelName = data.channel;
+
+                    // Reset reconnect state on successful join
+                    this.reconnect.attempt = 0;
+                    this.reconnect.enabled = true;
+
+                    // Start keepalive ping every 30s
+                    if (this.keepaliveInterval) clearInterval(this.keepaliveInterval);
+                    this.keepaliveInterval = setInterval(() => {
+                      if (this.state.connected && this.state.socket && this.state.socket.readyState === WebSocket.OPEN) {
+                        this.state.socket.send(JSON.stringify({ type: "ping", channel: this.state.channel }));
+                      }
+                    }, 30000);
+
                     this.updateStatus(
                       true,
                       `Connected on port ${port}!<br>Copy the channel ID: <span class="mcp-plugin__channel-name" title="Click to copy">${channelName}</span>`
@@ -394,16 +428,22 @@
             };
 
             this.state.socket.onclose = () => {
+              // Save channel for reconnection before clearing state
+              if (this.state.channel) {
+                this.reconnect.lastChannel = this.state.channel;
+              }
               this.state.connected = false;
               this.state.socket = null;
-              this.updateStatus(false, "Disconnected from server…<br>Try to reconnect clicking the button");
+              if (this.keepaliveInterval) {
+                clearInterval(this.keepaliveInterval);
+                this.keepaliveInterval = null;
+              }
+              this.scheduleReconnect();
             };
 
             this.state.socket.onerror = (error) => {
               console.error("WebSocket error:", error);
-              this.updateStatus(false, "Connection error");
-              this.state.connected = false;
-              this.state.socket = null;
+              // Don't clear state here — onclose always fires after onerror and handles cleanup
             };
           } catch (error) {
             console.error("Connection error:", error);
@@ -418,13 +458,53 @@
          * Disconnect from WebSocket server
          */
         disconnect() {
+          // Disable auto-reconnect on explicit disconnect
+          this.reconnect.enabled = false;
+          if (this.reconnect.timer) {
+            clearTimeout(this.reconnect.timer);
+            this.reconnect.timer = null;
+          }
+          if (this.keepaliveInterval) {
+            clearInterval(this.keepaliveInterval);
+            this.keepaliveInterval = null;
+          }
           if (this.state.socket) {
             this.updateStatus(false, "Disconnecting...");
             this.ui.connectionStatus.className = "mcp-plugin__connection-status info";
             this.state.socket.close();
             this.state.socket = null;
             this.state.connected = false;
+            this.updateStatus(false, "Disconnected from server…<br>Try to reconnect clicking the button");
           }
+        }
+
+        /**
+         * Schedule an auto-reconnect attempt with exponential backoff
+         */
+        scheduleReconnect() {
+          if (!this.reconnect.enabled || this.reconnect.attempt >= this.reconnect.maxAttempts) {
+            this.updateStatus(false, "Disconnected from server…<br>Try to reconnect clicking the button");
+            return;
+          }
+          const delay = Math.min(
+            this.reconnect.baseDelay * Math.pow(1.5, this.reconnect.attempt),
+            this.reconnect.maxDelay
+          ) + Math.random() * 1000; // jitter
+          const delaySec = Math.round(delay / 1000);
+          this.updateStatus(
+            false,
+            `Reconnecting in ${delaySec}s… (attempt ${this.reconnect.attempt + 1}/${this.reconnect.maxAttempts})`
+          );
+          this.ui.connectionStatus.className = "mcp-plugin__connection-status info";
+          this.reconnect.timer = setTimeout(() => this.reconnectAttempt(), delay);
+        }
+
+        /**
+         * Attempt to reconnect to the WebSocket server
+         */
+        reconnectAttempt() {
+          this.reconnect.attempt++;
+          this.connect(this.state.serverPort);
         }
 
         /**
