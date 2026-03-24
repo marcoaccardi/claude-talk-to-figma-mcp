@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { sendCommandToFigma, joinChannel } from "../utils/websocket.js";
+import { sendCommandToFigma, joinChannel, checkChannelHealth } from "../utils/websocket.js";
 import { filterFigmaNode } from "../utils/figma-helpers.js";
 
 /**
@@ -342,6 +342,41 @@ export function registerDocumentTools(server: McpServer): void {
               text: `Error joining channel: ${error instanceof Error ? error.message : String(error)}`,
             },
           ],
+        };
+      }
+    }
+  );
+
+  // Connection Status Tool
+  server.tool(
+    "get_connection_status",
+    "Check the current connection status to Figma, including WebSocket state and channel health. Use this to diagnose connection issues before sending commands.",
+    {},
+    async () => {
+      try {
+        const health = await checkChannelHealth();
+        const status = {
+          websocketConnected: health.connected,
+          channel: health.channel,
+          pluginClientsInChannel: health.clients,
+          healthy: health.connected && health.clients >= 2,
+          message: !health.connected
+            ? "Not connected to bridge server. The WebSocket bridge may not be running."
+            : health.channel === null
+            ? "Connected to bridge but not joined to any channel. Use join_channel first."
+            : health.clients < 2
+            ? "Connected to channel but Figma plugin may not be connected. Check that the plugin is running and connected to the same channel."
+            : "Connection healthy. Both MCP server and Figma plugin are connected.",
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(status, null, 2) }],
+        };
+      } catch (error) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error checking connection status: ${error instanceof Error ? error.message : String(error)}`,
+          }],
         };
       }
     }
