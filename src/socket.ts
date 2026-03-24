@@ -117,6 +117,30 @@ const server = Bun.serve({
       });
     }
 
+    // Handle per-channel health endpoint
+    if (url.pathname.startsWith("/channels/")) {
+      const channelName = decodeURIComponent(url.pathname.slice("/channels/".length));
+      const channelClients = channels.get(channelName);
+      if (!channelClients) {
+        return new Response(JSON.stringify({ exists: false, clients: 0 }), {
+          status: 404,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+      let activeCount = 0;
+      channelClients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) activeCount++;
+      });
+      return new Response(JSON.stringify({
+        exists: true,
+        channel: channelName,
+        clients: activeCount,
+        timestamp: Date.now()
+      }), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+    }
+
     // Handle WebSocket upgrade
     try {
       const success = server.upgrade(req, {
@@ -143,6 +167,7 @@ const server = Bun.serve({
     });
   },
   websocket: {
+    idleTimeout: 120, // seconds — Bun closes connections with no data for this period
     open: handleConnection,
     message(ws: ServerWebSocket<any>, message: string | Buffer) {
       try {
@@ -272,6 +297,18 @@ const server = Bun.serve({
           }
         }
         
+        // Handle application-level ping (keepalive from plugin UI / MCP client)
+        if (data.type === "ping") {
+          try {
+            ws.send(JSON.stringify({ type: "pong", channel: data.channel, timestamp: Date.now() }));
+            stats.messagesSent++;
+          } catch (error) {
+            logger.error("Failed to send pong:", error);
+            stats.errors++;
+          }
+          return;
+        }
+
         // Handle progress updates
         if (data.type === "progress_update") {
           const channelName = data.channel;
@@ -347,3 +384,22 @@ setInterval(() => {
     ...stats
   });
 }, 5 * 60 * 1000);
+
+// Periodic stale-connection sweep every 60 seconds
+setInterval(() => {
+  let cleaned = 0;
+  channels.forEach((clients, channelName) => {
+    clients.forEach(client => {
+      if (client.readyState !== WebSocket.OPEN) {
+        clients.delete(client);
+        cleaned++;
+      }
+    });
+    if (clients.size === 0) {
+      channels.delete(channelName);
+    }
+  });
+  if (cleaned > 0) {
+    logger.info(`Cleaned ${cleaned} stale connection(s) from channels`);
+  }
+}, 60 * 1000);
